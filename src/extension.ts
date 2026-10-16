@@ -18,6 +18,8 @@ type DayPoint = {
   count: number;
 };
 
+type HourPoint = { date: string; hour: number; count: number };
+
 type NamedMetric = {
   name: string;
   value: string;
@@ -48,6 +50,8 @@ type ProfileData = {
   peakTokens: string;
   totalCredits: string;
   totalCreditsRaw: number;
+  creditPrice: string;
+  creditUsage: string;
   currentStreak: string;
   currentStreakRaw: number;
   longestStreak: string;
@@ -55,6 +59,7 @@ type ProfileData = {
   activeDays: string;
   activeDaysRaw: number;
   heatmap: DayPoint[];
+  hourlyHeatmap: HourPoint[];
   availableYears: number[];
   insights: NamedMetric[];
   topItems: NamedMetric[];
@@ -82,6 +87,8 @@ type KiroUsage = {
   averageTurnMinutes: number;
   modelCounts: Map<string, number>;
   tokenCountsByDay: Map<string, number>;
+  // key = `${isoDate}#${hour}`, value = tokens
+  tokenCountsByHour: Map<string, number>;
   // New stats
   totalTurns: number;
   failedTurns: number;
@@ -98,6 +105,7 @@ type KiroUsage = {
   ideSessionCount: number;
   tokenLogRows: number;
   logDirCount: number;
+  scanLimited: boolean;
 };
 
 type LocalKiroAccount = {
@@ -151,6 +159,8 @@ const LANGUAGE_BY_EXTENSION = new Map<string, string>([
   [".yml", "YAML"],
   [".yaml", "YAML"]
 ]);
+
+const CREDIT_PRICE_USD = 0.04;
 
 export function activate(context: vscode.ExtensionContext) {
   const output = vscode.window.createOutputChannel("Kiro Stat");
@@ -588,6 +598,8 @@ async function collectProfileData(context: vscode.ExtensionContext): Promise<Pro
     peakTokens: formatCompact(kiroUsage.peakDayTokens),
     totalCredits: formatCredits(kiroUsage.totalCredits),
     totalCreditsRaw: Math.max(0, Math.round(kiroUsage.totalCredits * 100) / 100),
+    creditPrice: formatUsd(kiroUsage.totalCredits * CREDIT_PRICE_USD),
+    creditUsage: `${Math.round(kiroUsage.totalCredits)} cr`,
     currentStreak: currentStreakLabel,
     currentStreakRaw: Math.max(0, currentStreak),
     longestStreak: longestStreakLabel,
@@ -595,6 +607,7 @@ async function collectProfileData(context: vscode.ExtensionContext): Promise<Pro
     activeDays: `${activeCounts.length}`,
     activeDaysRaw: activeCounts.length,
     heatmap,
+    hourlyHeatmap: buildHourlyHeatmap(kiroUsage.tokenCountsByHour),
     availableYears,
     insights: [
       { name: "Kiro launches, last 30 days", value: `${kiroUsage.opensLast30Days}` },
@@ -680,6 +693,7 @@ async function collectProfileData(context: vscode.ExtensionContext): Promise<Pro
       { name: "IDE Session Files", value: `${kiroUsage.ideSessionCount}` },
       { name: "Kiro Launch Log Dirs", value: `${kiroUsage.logDirCount}` },
       { name: "Token Log Rows", value: `${kiroUsage.tokenLogRows}` },
+      { name: "Scan status", value: kiroUsage.scanLimited ? "Partial (scan cap reached)" : "Complete" },
       { name: "Workspace Languages", value: `${fileStats.size}` },
       { name: "Tracked Code Files", value: `${totalLanguageFiles}` },
       { name: "Top Model", value: topModel ? formatModelName(topModel[0]) : "N/A" },
@@ -763,6 +777,7 @@ async function getKiroUsage(): Promise<KiroUsage> {
   let turnCount = 0;
   const modelCounts = new Map<string, number>();
   const tokenCountsByDay = new Map<string, number>();
+  const tokenCountsByHour = new Map<string, number>();
   const cutoff = atStartOfDay(new Date());
   cutoff.setDate(cutoff.getDate() - 29);
   // New tracking
@@ -781,6 +796,7 @@ async function getKiroUsage(): Promise<KiroUsage> {
   let ideSessionCount = 0;
   let tokenLogRows = 0;
   let logDirCount = 0;
+  let scanLimited = false;
 
   for (const logsRoot of logsRoots) {
     try {
@@ -808,23 +824,60 @@ async function getKiroUsage(): Promise<KiroUsage> {
 
   try {
     const sessionRoot = path.join(kiroHome, "sessions");
-    const sessionFiles = await listFiles(sessionRoot);
+    const sessionFiles = await listFiles(sessionRoot, () => {
+      scanLimited = true;
+    });
     for (const file of sessionFiles) {
-      if (!file.endsWith(".json") && !file.endsWith(".jsonl")) {
+      const lowerFile = file.toLowerCase();
+      const baseName = path.basename(lowerFile);
+      const isJsonl = lowerFile.endsWith(".jsonl");
+      if (!lowerFile.endsWith(".json") && !isJsonl) {
+        continue;
+      }
+      const pathSegments = file.split(/[\\/]/);
+      // Workspace file snapshots and directory index files live under the sessions root but are not sessions.
+      if (pathSegments.includes("snapshots") || baseName === "index.json") {
         continue;
       }
       const stat = await fs.stat(file);
-      if (file.endsWith(".json")) {
-        sessionCount += 1;
-        cliSessionCount += 1;
-      }
       largestSessionBytes = Math.max(largestSessionBytes, stat.size);
       const fallbackDay = toIsoDate(stat.mtime);
-      days.push(fallbackDay);
 
-      if (!file.endsWith(".json")) {
+      // New nested layout: one session.json per IDE session (count the session once, here).
+      if (baseName === "session.json") {
+        const parsed = (await readJsonFile(file)) as Record<string, unknown> | undefined;
+        const created = parseKiroDate(parsed?.createdAt) ?? parseKiroDate(parsed?.lastModifiedAt) ?? stat.mtime;
+        days.push(toIsoDate(created));
+        sessionCount += 1;
+        ideSessionCount += 1;
+        const modelId = typeof parsed?.modelId === "string" ? parsed.modelId.trim() : "";
+        if (modelId) {
+          modelCounts.set(modelId, (modelCounts.get(modelId) || 0) + 1);
+        }
         continue;
       }
+
+      // New nested layout: per-session transcript — tool/hour/day data only (session counted above).
+      if (baseName === "messages.jsonl") {
+        mergeJsonlActivity(await readJsonlActivity(file), { days, hourlyActivity, toolUsageCounts, modelCounts });
+        continue;
+      }
+
+      // CLI transcripts and any other .jsonl session records (no tokens available).
+      if (isJsonl) {
+        sessionCount += 1;
+        if (pathSegments.includes("cli")) {
+          cliSessionCount += 1;
+        }
+        days.push(fallbackDay);
+        mergeJsonlActivity(await readJsonlActivity(file), { days, hourlyActivity, toolUsageCounts, modelCounts });
+        continue;
+      }
+
+      // Legacy flat *.json session (counted as a CLI session to preserve prior behavior).
+      sessionCount += 1;
+      cliSessionCount += 1;
+      days.push(fallbackDay);
 
       const parsed = await readJsonFile(file);
       const metrics = collectSessionMetrics(parsed, stat.size, fallbackDay);
@@ -837,6 +890,9 @@ async function getKiroUsage(): Promise<KiroUsage> {
       }
       for (const [day, tokens] of metrics.tokenCountsByDay) {
         tokenCountsByDay.set(day, (tokenCountsByDay.get(day) || 0) + tokens);
+      }
+      for (const [key, tokens] of metrics.tokenCountsByHour) {
+        tokenCountsByHour.set(key, (tokenCountsByHour.get(key) || 0) + tokens);
       }
       for (const [model, count] of metrics.modelCounts) {
         modelCounts.set(model, (modelCounts.get(model) || 0) + count);
@@ -911,7 +967,9 @@ async function getKiroUsage(): Promise<KiroUsage> {
 
     try {
       const wsRoot = path.join(agentStorageRoot, "workspace-sessions");
-      const allSessionFiles = await listFiles(wsRoot);
+      const allSessionFiles = await listFiles(wsRoot, () => {
+        scanLimited = true;
+      });
       for (const file of allSessionFiles) {
         if (!file.endsWith(".json") || path.basename(file).toLowerCase() === "sessions.json") continue;
 
@@ -944,6 +1002,9 @@ async function getKiroUsage(): Promise<KiroUsage> {
         }
         for (const [metricDay, tokens] of metrics.tokenCountsByDay) {
           tokenCountsByDay.set(metricDay, (tokenCountsByDay.get(metricDay) || 0) + tokens);
+        }
+        for (const [key, tokens] of metrics.tokenCountsByHour) {
+          tokenCountsByHour.set(key, (tokenCountsByHour.get(key) || 0) + tokens);
         }
         for (const [model, count] of metrics.modelCounts) {
           modelCounts.set(model, (modelCounts.get(model) || 0) + count);
@@ -1046,6 +1107,7 @@ async function getKiroUsage(): Promise<KiroUsage> {
     averageTurnMinutes: turnCount > 0 ? totalTurnSeconds / turnCount / 60 : 0,
     modelCounts,
     tokenCountsByDay,
+    tokenCountsByHour,
     totalTurns,
     failedTurns,
     toolUsageCounts,
@@ -1060,7 +1122,8 @@ async function getKiroUsage(): Promise<KiroUsage> {
     cliSessionCount,
     ideSessionCount,
     tokenLogRows,
-    logDirCount
+    logDirCount,
+    scanLimited
   };
 }
 
@@ -1071,6 +1134,8 @@ type SessionMetrics = {
   turnCount: number;
   days: string[];
   tokenCountsByDay: Map<string, number>;
+  // key = `${isoDate}#${hour}`, value = tokens
+  tokenCountsByHour: Map<string, number>;
   modelCounts: Map<string, number>;
   totalTurns: number;
   failedTurns: number;
@@ -1416,6 +1481,7 @@ function collectSessionMetrics(root: unknown, fileSize: number, fallbackDay: str
     turnCount: 0,
     days: [],
     tokenCountsByDay: new Map(),
+    tokenCountsByHour: new Map(),
     modelCounts: new Map(),
     totalTurns: 0,
     failedTurns: 0,
@@ -1433,10 +1499,14 @@ function collectSessionMetrics(root: unknown, fileSize: number, fallbackDay: str
   let sessionStartMs: number | undefined;
   let sessionEndMs: number | undefined;
 
-  function addTokens(day: string, tokens: number) {
+  function addTokens(day: string, tokens: number, hour?: number) {
     if (tokens <= 0) return;
     metrics.tokens += tokens;
     metrics.tokenCountsByDay.set(day, (metrics.tokenCountsByDay.get(day) || 0) + tokens);
+    if (hour !== undefined) {
+      const key = day + "#" + hour;
+      metrics.tokenCountsByHour.set(key, (metrics.tokenCountsByHour.get(key) || 0) + tokens);
+    }
   }
 
   // Iterative traversal with a depth cap to avoid stack overflows on large session files
@@ -1454,6 +1524,16 @@ function collectSessionMetrics(root: unknown, fileSize: number, fallbackDay: str
       metrics.days.push(discoveredDay);
     }
 
+    // Derive the record hour once so tokens can be attributed to (day, hour).
+    let recordHour: number | undefined;
+    for (const key of ["end_timestamp", "updated_at", "created_at", "timestamp"]) {
+      const d = parseKiroDate(record[key]);
+      if (d && !Number.isNaN(d.getTime())) {
+        recordHour = d.getHours();
+        break;
+      }
+    }
+
     // --- tokens ---
     const inputTokens =
       numberValue(record.input_token_count) || numberValue(record.inputTokens) || numberValue(record.promptTokens);
@@ -1461,7 +1541,7 @@ function collectSessionMetrics(root: unknown, fileSize: number, fallbackDay: str
       numberValue(record.output_token_count) || numberValue(record.outputTokens) || numberValue(record.generatedTokens);
     const tokenTotal = inputTokens + outputTokens;
     if (tokenTotal > 0) {
-      addTokens(discoveredDay, tokenTotal);
+      addTokens(discoveredDay, tokenTotal, recordHour);
       if (inputTokens > 0) metrics.promptTokens += inputTokens;
       if (outputTokens > 0) metrics.generatedTokens += outputTokens;
     }
@@ -1521,15 +1601,8 @@ function collectSessionMetrics(root: unknown, fileSize: number, fallbackDay: str
     }
 
     // --- hourly activity from timestamps ---
-    for (const key of ["end_timestamp", "updated_at", "created_at", "timestamp"]) {
-      const val = record[key];
-      const d = parseKiroDate(val);
-      if (d) {
-        if (!Number.isNaN(d.getTime())) {
-          metrics.hourlyActivity.set(d.getHours(), (metrics.hourlyActivity.get(d.getHours()) || 0) + 1);
-          break;
-        }
-      }
+    if (recordHour !== undefined) {
+      metrics.hourlyActivity.set(recordHour, (metrics.hourlyActivity.get(recordHour) || 0) + 1);
     }
 
     // --- session duration boundaries ---
@@ -1623,9 +1696,114 @@ function numberValue(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) ? value : 0;
 }
 
-async function listFiles(root: string): Promise<string[]> {
-  const maxFiles = vscode.workspace.getConfiguration("kiroStat").get<number>("maxScanFiles", 2_000);
-  return (await listFilesBounded(root, { maxFiles })).files;
+async function listFiles(root: string, onLimited?: () => void): Promise<string[]> {
+  const cfg = vscode.workspace.getConfiguration("kiroStat");
+  const maxFiles = cfg.get<number>("maxScanFiles", 20_000);
+  const maxTotalBytes = cfg.get<number>("maxScanBytes", 250 * 1024 * 1024);
+  const scan = await listFilesBounded(root, {
+    maxFiles,
+    maxTotalBytes,
+    preferNewest: true,
+    accept: (name) => name.toLowerCase().endsWith(".json") || name.toLowerCase().endsWith(".jsonl")
+  });
+  if (scan.limited) {
+    onLimited?.();
+  }
+  return scan.files;
+}
+
+type JsonlActivity = {
+  days: string[];
+  hourlyActivity: Map<number, number>;
+  toolUsageCounts: Map<string, number>;
+  modelCounts: Map<string, number>;
+};
+
+// Reads a JSONL transcript (CLI sessions, nested messages.jsonl) for day/hour/tool/model signals.
+// No token fields exist in these records, so tokens are intentionally left to the existing estimates.
+async function readJsonlActivity(file: string): Promise<JsonlActivity> {
+  const activity: JsonlActivity = {
+    days: [],
+    hourlyActivity: new Map(),
+    toolUsageCounts: new Map(),
+    modelCounts: new Map()
+  };
+  let content: string;
+  try {
+    content = await fs.readFile(file, "utf8");
+  } catch {
+    return activity;
+  }
+
+  for (const line of content.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    let record: Record<string, unknown>;
+    try {
+      record = JSON.parse(line) as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (!record || typeof record !== "object") continue;
+
+    const data = record.data && typeof record.data === "object" ? (record.data as Record<string, unknown>) : undefined;
+    const meta = data?.meta && typeof data.meta === "object" ? (data.meta as Record<string, unknown>) : undefined;
+    const payload =
+      record.payload && typeof record.payload === "object" ? (record.payload as Record<string, unknown>) : undefined;
+
+    const timestamp =
+      record.timestamp ??
+      record.createdAt ??
+      record.lastModifiedAt ??
+      data?.timestamp ??
+      data?.createdAt ??
+      meta?.timestamp;
+    const date = parseKiroDate(timestamp);
+    if (date && !Number.isNaN(date.getTime())) {
+      activity.days.push(toIsoDate(date));
+      const hour = date.getHours();
+      activity.hourlyActivity.set(hour, (activity.hourlyActivity.get(hour) || 0) + 1);
+    }
+
+    let toolName = "";
+    for (const candidate of [payload?.toolName, data?.toolName, record.toolName]) {
+      if (typeof candidate === "string" && candidate.trim()) {
+        toolName = candidate.trim();
+        break;
+      }
+    }
+    if (toolName) {
+      activity.toolUsageCounts.set(toolName, (activity.toolUsageCounts.get(toolName) || 0) + 1);
+    }
+
+    const modelId = record.modelId ?? record.model_id ?? data?.modelId;
+    if (typeof modelId === "string" && modelId.trim()) {
+      const model = modelId.trim();
+      activity.modelCounts.set(model, (activity.modelCounts.get(model) || 0) + 1);
+    }
+  }
+
+  return activity;
+}
+
+function mergeJsonlActivity(
+  activity: JsonlActivity,
+  target: {
+    days: string[];
+    hourlyActivity: Map<number, number>;
+    toolUsageCounts: Map<string, number>;
+    modelCounts: Map<string, number>;
+  }
+): void {
+  for (const day of activity.days) target.days.push(day);
+  for (const [hour, count] of activity.hourlyActivity) {
+    target.hourlyActivity.set(hour, (target.hourlyActivity.get(hour) || 0) + count);
+  }
+  for (const [tool, count] of activity.toolUsageCounts) {
+    target.toolUsageCounts.set(tool, (target.toolUsageCounts.get(tool) || 0) + count);
+  }
+  for (const [model, count] of activity.modelCounts) {
+    target.modelCounts.set(model, (target.modelCounts.get(model) || 0) + count);
+  }
 }
 
 async function countFiles(root: string, extension: string): Promise<number> {
@@ -1665,6 +1843,17 @@ function buildHeatmap(days: string[]): DayPoint[] {
   }
 
   return buildHeatmapFromCounts(counts, days);
+}
+
+function buildHourlyHeatmap(counts: Map<string, number>): HourPoint[] {
+  const points: HourPoint[] = [];
+  for (const [key, count] of counts) {
+    const [date, hourRaw] = key.split("#");
+    const hour = Number(hourRaw);
+    if (!date || !Number.isFinite(hour)) continue;
+    points.push({ date, hour, count });
+  }
+  return points;
 }
 
 function buildHeatmapFromCounts(counts: Map<string, number>, fallbackDays: string[] = []): DayPoint[] {
@@ -1774,6 +1963,10 @@ function formatCredits(value: number): string {
   return value.toFixed(value >= 10 ? 1 : 2);
 }
 
+function formatUsd(value: number): string {
+  return `$${value.toFixed(2)}`;
+}
+
 function formatDuration(minutes: number): string {
   const hours = Math.floor(minutes / 60);
   const mins = Math.round(minutes % 60);
@@ -1809,9 +2002,56 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
   <style nonce="${nonce}">
 
     :root {
-      color-scheme: light;
+      color-scheme: light dark;
       --cream: #faf3e3;
       --ink: #111111;
+      --line: #111111;
+      --muted: #555555;
+      --pink: #ff6bb3;
+      --pink-soft: #ffb1d8;
+      --purple: #b080ff;
+      --lime: #a8e84a;
+      --blue: #3360ff;
+      --yellow: #ffd63d;
+      --white: #ffffff;
+      --empty: #ece2cb;
+      --up: #1d7a2c;
+      --ink-soft: rgba(17, 17, 17, 0.72);
+      --on-accent: #111111;
+      --on-accent-soft: rgba(17, 17, 17, 0.82);
+      --on-blue: #ffffff;
+      --shadow: 3px 3px 0 var(--line);
+      --shadow-big: 4px 4px 0 var(--line);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --cream: #19161d;
+        --ink: #ffffff;
+        --muted: #938f9b;
+        --pink: #ff80b5;
+        --pink-soft: #2e2736;
+        --purple: #b080ff;
+        --lime: #80ffb5;
+        --blue: #8dc8fb;
+        --yellow: #ffcf99;
+        --white: #28242e;
+        --empty: #3a3442;
+        --up: #80ffb5;
+        --ink-soft: rgba(255, 255, 255, 0.72);
+        --line: #4d4657;
+        --on-blue: #1a1620;
+        --shadow: 3px 3px 0 var(--line);
+        --shadow-big: 4px 4px 0 var(--line);
+        color-scheme: dark;
+      }
+    }
+
+    /* Explicit overrides (beat the media query by specificity) */
+    :root[data-theme="light"] {
+      --cream: #faf3e3;
+      --ink: #111111;
+      --line: #111111;
       --muted: #555555;
       --pink: #ff6bb3;
       --pink-soft: #ffb1d8;
@@ -1819,8 +2059,34 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       --blue: #3360ff;
       --yellow: #ffd63d;
       --white: #ffffff;
-      --shadow: 3px 3px 0 var(--ink);
-      --shadow-big: 4px 4px 0 var(--ink);
+      --empty: #ece2cb;
+      --up: #1d7a2c;
+      --ink-soft: rgba(17, 17, 17, 0.72);
+      --on-blue: #ffffff;
+      --shadow: 3px 3px 0 var(--line);
+      --shadow-big: 4px 4px 0 var(--line);
+      color-scheme: light;
+    }
+
+    :root[data-theme="dark"] {
+      --cream: #19161d;
+      --ink: #ffffff;
+      --muted: #938f9b;
+      --pink: #ff80b5;
+      --pink-soft: #2e2736;
+      --purple: #b080ff;
+      --lime: #80ffb5;
+      --blue: #8dc8fb;
+      --yellow: #ffcf99;
+      --white: #28242e;
+      --empty: #3a3442;
+      --up: #80ffb5;
+      --ink-soft: rgba(255, 255, 255, 0.72);
+      --line: #4d4657;
+      --on-blue: #1a1620;
+      --shadow: 3px 3px 0 var(--line);
+      --shadow-big: 4px 4px 0 var(--line);
+      color-scheme: dark;
     }
 
     * {
@@ -1878,7 +2144,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       align-items: center;
       gap: 18px;
       margin: 14px 0 26px;
-      border: 3px solid var(--ink);
+      border: 3px solid var(--line);
       border-radius: 14px;
       background: var(--white);
       box-shadow: var(--shadow-big);
@@ -1897,6 +2163,14 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       width: 100%;
       display: block;
       animation: bob 2.8s ease-in-out infinite;
+    }
+
+    .header-ghost svg path {
+      fill: var(--white);
+      stroke: var(--purple);
+    }
+    .header-ghost svg ellipse {
+      fill: var(--line);
     }
 
     @media (prefers-reduced-motion: reduce) {
@@ -1920,9 +2194,9 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       border-radius: 14px;
       display: grid;
       place-items: center;
-      border: 3px solid var(--ink);
-      background: var(--pink-soft);
-      color: var(--ink);
+      border: 3px solid var(--line);
+      background: var(--purple);
+      color: var(--on-accent);
       font-size: 20px;
       font-weight: 900;
       box-shadow: var(--shadow);
@@ -1953,7 +2227,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     }
 
     .badge {
-      border: 2px solid var(--ink);
+      border: 2px solid var(--line);
       background: var(--yellow);
       color: var(--ink);
       border-radius: 7px;
@@ -1980,7 +2254,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
 
     .action,
     .public-toggle {
-      border: 2.5px solid var(--ink);
+      border: 2.5px solid var(--line);
       border-radius: 9px;
       background: var(--white);
       color: var(--ink);
@@ -1997,13 +2271,13 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     .action:hover,
     .public-toggle:hover {
       transform: translate(-1px, -1px);
-      box-shadow: 4px 4px 0 var(--ink);
+      box-shadow: 4px 4px 0 var(--line);
     }
 
     .action:active,
     .public-toggle:active {
       transform: translate(2px, 2px);
-      box-shadow: 1px 1px 0 var(--ink);
+      box-shadow: 1px 1px 0 var(--line);
     }
 
     .action svg {
@@ -2020,7 +2294,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
 
     .sync-button {
       background: var(--blue);
-      color: var(--white);
+      color: var(--on-blue);
     }
 
     .public-toggle {
@@ -2043,6 +2317,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
 
     .public-toggle.is-public {
       background: var(--lime);
+      color: var(--on-accent);
     }
 
     .sync-subtext {
@@ -2056,7 +2331,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       width: 8px;
       height: 8px;
       border-radius: 999px;
-      border: 2px solid var(--ink);
+      border: 2px solid var(--line);
       background: var(--lime);
       margin-left: 6px;
     }
@@ -2073,7 +2348,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     .metric-card {
       position: relative;
       min-height: 130px;
-      border: 3px solid var(--ink);
+      border: 3px solid var(--line);
       border-radius: 12px;
       background: var(--white);
       padding: 14px;
@@ -2086,7 +2361,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     }
 
     .metric-card.soft {
-      background: var(--pink-soft);
+      background: var(--purple);
     }
 
     .metric-label {
@@ -2113,6 +2388,17 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       line-height: 1;
       font-weight: 900;
       color: var(--ink);
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      row-gap: 3px;
+    }
+
+    .metric-credit-note {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+      white-space: nowrap;
     }
 
     .metric-sub {
@@ -2124,14 +2410,14 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     }
 
     .metric-up {
-      color: #1d7a2c;
+      color: var(--up);
     }
 
     /* ---------- highlight strip ---------- */
 
     .stats {
       margin: 0 0 14px;
-      border: 3px solid var(--ink);
+      border: 3px solid var(--line);
       border-radius: 12px;
       display: grid;
       grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -2147,7 +2433,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     }
 
     .stat + .stat {
-      border-left: 2.5px solid var(--ink);
+      border-left: 2.5px solid var(--line);
     }
 
     .stat-token {
@@ -2180,7 +2466,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     }
 
     .stat-token .stat-label {
-      color: rgba(17, 17, 17, 0.72);
+      color: var(--ink-soft);
     }
 
     /* ---------- panels ---------- */
@@ -2193,7 +2479,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     }
 
     .panel {
-      border: 3px solid var(--ink);
+      border: 3px solid var(--line);
       border-radius: 12px;
       background: var(--white);
       padding: 14px;
@@ -2217,11 +2503,11 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       font-weight: 900;
       text-transform: uppercase;
       letter-spacing: 0.02em;
-      border: 2.5px solid var(--ink);
+      border: 2.5px solid var(--line);
       border-radius: 8px;
-      background: var(--pink);
+      background: var(--purple);
       padding: 5px 10px;
-      box-shadow: 2px 2px 0 var(--ink);
+      box-shadow: 2px 2px 0 var(--line);
     }
 
     .panel-title svg {
@@ -2238,15 +2524,88 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
 
     .year-select {
       min-width: 82px;
-      border: 2.5px solid var(--ink);
+      border: 2.5px solid var(--line);
       border-radius: 8px;
       background: var(--white);
       color: var(--ink);
       padding: 4px 8px;
       font: inherit;
       font-weight: 700;
-      box-shadow: 2px 2px 0 var(--ink);
+      box-shadow: 2px 2px 0 var(--line);
     }
+
+    .view-toggle {
+      display: inline-flex;
+      border: 2.5px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 2px 2px 0 var(--line);
+    }
+
+    .view-btn {
+      border: 0;
+      background: var(--white);
+      color: var(--ink);
+      padding: 4px 12px;
+      font: inherit;
+      font-weight: 800;
+      cursor: pointer;
+    }
+
+    .view-btn + .view-btn { border-left: 2.5px solid var(--line); }
+    .view-btn[aria-pressed="true"] { background: var(--lime); }
+
+    .theme-toggle {
+      display: inline-flex;
+      border: 2.5px solid var(--line);
+      border-radius: 9px;
+      overflow: hidden;
+      box-shadow: var(--shadow);
+      background: var(--white);
+    }
+    .theme-btn {
+      border: 0;
+      background: var(--white);
+      color: var(--ink);
+      padding: 5px 8px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    .theme-btn svg { width: 14px; height: 14px; }
+    .theme-btn + .theme-btn { border-left: 2.5px solid var(--line); }
+    .theme-btn[aria-pressed="true"] { background: var(--lime); }
+
+    .month-hours {
+      display: grid;
+      gap: 3px;
+      overflow-x: auto;
+      align-items: center;
+    }
+
+    .month-hours.hidden,
+    .weekday-grid.hidden,
+    .heatmap-wrap.hidden,
+    #month-select.hidden { display: none; }
+
+    .month-hours .hour-label {
+      font-size: 9px;
+      font-weight: 700;
+      color: var(--muted);
+      text-align: right;
+      padding-right: 2px;
+    }
+
+    .month-hours .hour-head {
+      font-size: 9px;
+      font-weight: 700;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .month-hours .cell { width: 12px; height: 12px; }
+    .month-hours .cell.is-future { opacity: 0.3; }
 
     /* ---------- heatmap ---------- */
 
@@ -2287,7 +2646,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       width: 11px;
       height: 11px;
       border-radius: 3px;
-      background: #ece2cb;
+      background: var(--empty);
     }
 
     .level-1 { background: var(--lime); }
@@ -2375,7 +2734,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       border-radius: 7px;
       display: grid;
       place-items: center;
-      border: 2px solid var(--ink);
+      border: 2px solid var(--line);
       background: var(--yellow);
       color: var(--ink);
       font-size: 9px;
@@ -2384,7 +2743,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
 
     .model-icon {
       background: var(--blue);
-      color: var(--white);
+      color: var(--on-blue);
     }
 
     .plugin-name {
@@ -2458,6 +2817,12 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
         grid-template-columns: 1fr;
       }
 
+      .metric-value {
+        flex-direction: row;
+        align-items: baseline;
+        column-gap: 8px;
+      }
+
       .stats {
         grid-template-columns: repeat(2, minmax(0, 1fr));
       }
@@ -2467,7 +2832,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       }
 
       .stat {
-        border-top: 2.5px solid var(--ink);
+        border-top: 2.5px solid var(--line);
       }
 
       .stat:first-child,
@@ -2479,6 +2844,34 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
         justify-content: start;
       }
     }
+
+    /* ---------- dark-mode accent contrast ---------- */
+    /* Bright accent surfaces (yellow/pink/lime) stay bright in dark mode, so
+       their text must always be dark. These tokens are theme-independent. */
+    .metric-card.hot .metric-label,
+    .metric-card.hot .metric-value { color: var(--on-accent); }
+    .metric-card.hot .metric-sub,
+    .metric-card.hot .metric-credit-note { color: var(--on-accent-soft); }
+    .metric-card.hot .metric-icon { color: var(--on-accent); }
+    .metric-card.hot .metric-up { color: var(--on-accent-soft); }
+
+    .metric-card.soft .metric-label,
+    .metric-card.soft .metric-value { color: var(--on-accent); }
+    .metric-card.soft .metric-sub { color: var(--on-accent-soft); }
+    .metric-card.soft .metric-icon { color: var(--on-accent); }
+
+    .badge { color: var(--on-accent); }
+    .panel-title { color: var(--on-accent); }
+    .panel-title svg { color: var(--on-accent); }
+    .lang-icon:not(.model-icon) { color: var(--on-accent); }
+
+    .stat-token .stat-value,
+    .stat-peak .stat-value { color: var(--on-accent); }
+    .stat-token .stat-label,
+    .stat-peak .stat-label { color: var(--on-accent-soft); }
+
+    .theme-btn[aria-pressed="true"],
+    .view-btn[aria-pressed="true"] { color: var(--on-accent); }
   </style>
 </head>
 <body>
@@ -2496,9 +2889,12 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
         </div>
       </div>
       <div class="header-actions">
+        <div class="theme-toggle" role="group" aria-label="Theme">
+          <button type="button" class="theme-btn" data-theme-value="light" aria-pressed="false" title="Light theme" aria-label="Light theme">${sunIcon()}</button>
+          <button type="button" class="theme-btn" data-theme-value="dark" aria-pressed="false" title="Dark theme" aria-label="Dark theme">${moonIcon()}</button>
+          <button type="button" class="theme-btn" data-theme-value="system" aria-pressed="true" title="Follow system / Kiro theme" aria-label="Follow system theme">${monitorIcon()}</button>
+        </div>
         <div class="sync-row">
-          <button class="public-toggle ${data.leaderboardPublic ? "is-public" : ""}" title="Toggle public leaderboard profile" id="public-toggle" aria-pressed="${data.leaderboardPublic ? "true" : "false"}"><span id="public-toggle-icon">${data.leaderboardPublic ? globeIcon() : shieldLockIcon()}</span>${data.leaderboardPublic ? "Public" : "Private"}</button>
-          <button class="action leaderboard-button" title="Open leaderboard" id="leaderboard">${trophyIcon()}<span>Leaderboard</span></button>
           <button class="action share-button" title="Copy card to clipboard" id="share">${shareIcon()}<span>Copy card to clipboard</span></button>
           <button class="action sync-button" title="Refresh insights" id="refresh">${refreshIcon()}<span>Sync now</span></button>
         </div>
@@ -2510,7 +2906,7 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       ${metricCard("Plan / quota", data.planLabel, "From local profile or settings", starIcon(), "soft", "stat-plan")}
       ${metricCard("Kiro opens, 30d", data.kiroOpens30d, "From local launch logs", trendIcon(), "", "stat-opens")}
       ${metricCard("Local sessions", data.localSessions, "Tracked from Kiro sessions", calendarIcon(), "", "stat-sessions")}
-      ${metricCard("Credits used", data.totalCredits, "Metered by Kiro billing", cubeLineIcon(), "hot", "stat-credits")}
+      ${metricCard("Credits used", data.creditPrice, "Metered by Kiro billing", cubeLineIcon(), "hot credits", "stat-credits", data.creditUsage)}
     </section>
 
     <section class="stats" aria-label="Profile highlights">
@@ -2526,18 +2922,37 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
         <div class="panel-head">
           <h2 class="panel-title">${calendarIcon()} Daily activity</h2>
           <div class="activity-controls">
+            <div class="view-toggle" role="group" aria-label="Activity view">
+              <button type="button" class="view-btn" id="view-year" aria-pressed="false">Year</button>
+              <button type="button" class="view-btn" id="view-month" aria-pressed="true">Month</button>
+            </div>
             <select class="year-select" id="year-select" aria-label="Activity year">
               ${data.availableYears.map((year) => `<option value="${year}">${year}</option>`).join("")}
             </select>
+            <select class="year-select" id="month-select" aria-label="Activity month">
+              <option value="0">Jan</option>
+              <option value="1">Feb</option>
+              <option value="2">Mar</option>
+              <option value="3">Apr</option>
+              <option value="4">May</option>
+              <option value="5">Jun</option>
+              <option value="6">Jul</option>
+              <option value="7">Aug</option>
+              <option value="8">Sep</option>
+              <option value="9">Oct</option>
+              <option value="10">Nov</option>
+              <option value="11">Dec</option>
+            </select>
           </div>
         </div>
-        <div class="weekday-grid">
+        <div class="weekday-grid" id="year-view">
           <div class="weekday-labels"><span>Mon</span><span></span><span>Wed</span><span></span><span>Fri</span><span></span><span>Sun</span></div>
           <div class="heatmap-wrap">
             <div class="months" id="months"></div>
             <div class="heatmap" id="heatmap"></div>
           </div>
         </div>
+        <div class="month-hours hidden" id="month-view" aria-label="Monthly activity hours heatmap"></div>
         <div class="activity-legend">
           <span>Less activity</span>
           <span class="legend-cells"><span class="cell"></span><span class="cell level-1"></span><span class="cell level-2"></span><span class="cell level-3"></span><span class="cell level-4"></span></span>
@@ -2628,10 +3043,41 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
     let data = ${encoded};
     const heatmap = document.getElementById("heatmap");
     const yearSelect = document.getElementById("year-select");
+    const monthSelect = document.getElementById("month-select");
+    const yearViewBtn = document.getElementById("view-year");
+    const monthViewBtn = document.getElementById("view-month");
+    const yearView = document.getElementById("year-view");
+    const monthView = document.getElementById("month-view");
     const refreshButton = document.getElementById("refresh");
     const refreshStatus = document.getElementById("refresh-status");
-    const leaderboardButton = document.getElementById("leaderboard");
-    const publicToggleButton = document.getElementById("public-toggle");
+    let viewMode = "month";
+
+    const themeButtons = Array.from(document.querySelectorAll(".theme-btn"));
+
+    function applyThemeMode(mode) {
+      const normalized = mode === "light" || mode === "dark" ? mode : "system";
+      if (normalized === "system") {
+        delete document.documentElement.dataset.theme;
+      } else {
+        document.documentElement.dataset.theme = normalized;
+      }
+      themeButtons.forEach((btn) => {
+        btn.setAttribute("aria-pressed", btn.dataset.themeValue === normalized ? "true" : "false");
+      });
+    }
+
+    const savedState = vscode.getState() || {};
+    applyThemeMode(savedState.theme || "system");
+
+    themeButtons.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const mode = btn.dataset.themeValue || "system";
+        applyThemeMode(mode);
+        const next = vscode.getState() || {};
+        next.theme = mode;
+        vscode.setState(next);
+      });
+    });
 
     function formatCompact(value) {
       if (value >= 1000000) return (value / 1000000).toFixed(1) + "M";
@@ -2646,15 +3092,22 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       return year + "-" + month + "-" + day;
     }
 
-    function pointsForYear(year) {
-      const selectedYear = Number(year);
-      const today = new Date();
-      const currentYear = today.getFullYear();
-      const todayKey = localIsoDate(today);
+    function pointsForMonth(year, monthIndex) {
+      const monthKey = String(year) + "-" + String(Number(monthIndex) + 1).padStart(2, "0") + "-";
+      const todayKey = localIsoDate(new Date());
       return data.heatmap.filter((point) => {
-        if (!point.date.startsWith(String(year) + "-")) return false;
-        if (selectedYear > currentYear) return false;
-        if (selectedYear === currentYear && point.date > todayKey) return false;
+        if (!point.date.startsWith(monthKey)) return false;
+        if (point.date > todayKey) return false;
+        return true;
+      });
+    }
+
+    function pointsForYear(year) {
+      const yearKey = String(year) + "-";
+      const todayKey = localIsoDate(new Date());
+      return data.heatmap.filter((point) => {
+        if (!point.date.startsWith(yearKey)) return false;
+        if (point.date > todayKey) return false;
         return true;
       });
     }
@@ -2706,6 +3159,96 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
           monthsEl.appendChild(label);
         }
       });
+    }
+
+    function renderMonthHours(year, monthIndex) {
+      monthView.innerHTML = "";
+      const y = Number(year);
+      const m = Number(monthIndex);
+      const daysInMonth = new Date(y, m + 1, 0).getDate();
+      const monthKey = String(y) + "-" + String(m + 1).padStart(2, "0");
+      const todayKey = localIsoDate(new Date());
+
+      const byKey = new Map();
+      for (const p of (data.hourlyHeatmap || [])) byKey.set(p.date + "#" + p.hour, p.count);
+
+      // 6 rows of 4-hour buckets (24 hours do not divide into 7 rows).
+      const BUCKETS = 6;
+      const HOURS_PER_BUCKET = 4;
+
+      // Per-day columns (index 0 = day 1), each holding 6 aggregated bucket counts.
+      const columns = [];
+      let max = 1;
+      for (let day = 1; day <= daysInMonth; day++) {
+        const date = monthKey + "-" + String(day).padStart(2, "0");
+        const col = [];
+        for (let bucket = 0; bucket < BUCKETS; bucket++) {
+          let count = 0;
+          for (let h = bucket * HOURS_PER_BUCKET; h < (bucket + 1) * HOURS_PER_BUCKET; h++) {
+            count += byKey.get(date + "#" + h) || 0;
+          }
+          col.push({ date, bucket, count });
+          if (date <= todayKey && count > max) max = count;
+        }
+        columns.push(col);
+      }
+
+      monthView.style.gridTemplateColumns = "34px repeat(" + daysInMonth + ", 12px)";
+      monthView.style.gridTemplateRows = "14px repeat(" + BUCKETS + ", 12px)";
+
+      // Header row: empty corner + one day-number head per column.
+      const corner = document.createElement("span");
+      corner.className = "hour-label";
+      monthView.appendChild(corner);
+      for (let day = 1; day <= daysInMonth; day++) {
+        const head = document.createElement("span");
+        head.className = "hour-head";
+        head.textContent = String(day);
+        monthView.appendChild(head);
+      }
+
+      // One row per 4-hour bucket, row-major fill.
+      for (let bucket = 0; bucket < BUCKETS; bucket++) {
+        const startHour = bucket * HOURS_PER_BUCKET;
+        const endHour = startHour + HOURS_PER_BUCKET - 1;
+        const label = document.createElement("span");
+        label.className = "hour-label";
+        label.textContent = startHour + "-" + endHour;
+        monthView.appendChild(label);
+        for (let day = 1; day <= daysInMonth; day++) {
+          const cellData = columns[day - 1][bucket];
+          const count = cellData.count;
+          const cellEl = document.createElement("span");
+          const ratio = count / max;
+          const level = count <= 0 ? 0 : ratio > 0.75 ? 4 : ratio > 0.45 ? 3 : ratio > 0.2 ? 2 : 1;
+          cellEl.className = "cell level-" + level;
+          if (cellData.date > todayKey) cellEl.classList.add("is-future");
+          cellEl.title =
+            cellData.date + " " + String(startHour).padStart(2, "0") + ":00-" +
+            String(endHour).padStart(2, "0") + ":59 - " +
+            (count > 0 ? formatCompact(count) + " tokens" : "no activity");
+          monthView.appendChild(cellEl);
+        }
+      }
+    }
+
+    function renderActiveView() {
+      if (viewMode === "month") {
+        renderMonthHours(yearSelect.value, monthSelect.value);
+      } else {
+        renderHeatmap(yearSelect.value);
+      }
+    }
+
+    function applyView(mode) {
+      viewMode = mode;
+      const isMonth = mode === "month";
+      yearViewBtn.setAttribute("aria-pressed", String(!isMonth));
+      monthViewBtn.setAttribute("aria-pressed", String(isMonth));
+      monthSelect.classList.toggle("hidden", !isMonth);
+      yearView.classList.toggle("hidden", isMonth);
+      monthView.classList.toggle("hidden", !isMonth);
+      renderActiveView();
     }
 
     function escapeHtml(value) {
@@ -2806,7 +3349,8 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       setText("stat-opens", data.kiroOpens30d);
       setText("stat-sessions", data.localSessions);
       setText("stat-tokens", data.totalTokens);
-      setText("stat-credits", data.totalCredits);
+      const creditsEl = document.getElementById("stat-credits");
+      if (creditsEl) creditsEl.innerHTML = escapeHtml(data.creditPrice) + '<span class="metric-credit-note">' + escapeHtml(data.creditUsage) + '</span>';
       setText("stat-current-streak", data.currentStreak);
       setText("stat-longest-streak", data.longestStreak);
       setText("stat-peak-tokens", data.peakTokens);
@@ -2819,37 +3363,16 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       document.getElementById("languages-list").innerHTML = data.topItems.map(pluginRow).join("");
       document.getElementById("system-stats-list").innerHTML = data.systemStats.map(insightRow).join("");
       document.getElementById("data-sources-list").innerHTML = data.dataSources.map(insightRow).join("");
-      updatePublicToggle();
       updateYearOptions(data);
-      renderHeatmap(yearSelect.value);
+      renderActiveView();
     }
 
-    function updatePublicToggle() {
-      publicToggleButton.classList.toggle("is-public", Boolean(data.leaderboardPublic));
-      publicToggleButton.setAttribute("aria-pressed", data.leaderboardPublic ? "true" : "false");
-      publicToggleButton.innerHTML = '<span id="public-toggle-icon">' + (data.leaderboardPublic ? '${globeIcon()}' : '${shieldLockIcon()}') + '</span>' + (data.leaderboardPublic ? 'Public' : 'Private');
-      publicToggleButton.title = data.leaderboardPublic
-        ? "Profile is public and syncs on refresh"
-        : "Profile is private and does not sync";
-    }
-
-    function buildLeaderboardUrl() {
-      let url;
-      try {
-        url = new URL(data.leaderboardUrl || "http://localhost:3000");
-      } catch {
-        url = new URL("http://localhost:3000");
-      }
-
-      url.searchParams.set("name", data.displayName || "Kiro Developer");
-      url.searchParams.set("handle", data.accountLabel || data.username || "Local");
-      url.searchParams.set("tokens", String(Math.max(0, Math.round(Number(data.totalTokensRaw) || 0))));
-      return url.toString();
-    }
-
-    yearSelect.addEventListener("change", () => renderHeatmap(yearSelect.value));
-    updatePublicToggle();
-    renderHeatmap(yearSelect.value);
+    yearViewBtn.addEventListener("click", () => applyView("year"));
+    monthViewBtn.addEventListener("click", () => applyView("month"));
+    yearSelect.addEventListener("change", () => renderActiveView());
+    monthSelect.addEventListener("change", () => renderActiveView());
+    monthSelect.value = String(new Date().getMonth());
+    applyView("month");
 
     window.addEventListener("message", (event) => {
       if (event.data?.type === "profile-data") {
@@ -2866,17 +3389,6 @@ export function getProfileHtml(webview: vscode.Webview, extensionUri: vscode.Uri
       refreshButton.classList.add("is-loading");
       refreshStatus.textContent = "Refreshing";
       vscode.postMessage({ type: "refresh" });
-    });
-
-    leaderboardButton.addEventListener("click", () => {
-      vscode.postMessage({ type: "open-leaderboard", url: buildLeaderboardUrl() });
-    });
-
-    publicToggleButton.addEventListener("click", () => {
-      const nextValue = !data.leaderboardPublic;
-      publicToggleButton.innerHTML = '<span id="public-toggle-icon">' + (nextValue ? '${globeIcon()}' : '${shieldLockIcon()}') + '</span>' + (nextValue ? 'Publishing' : 'Private');
-      refreshStatus.textContent = nextValue ? "Publishing" : "Removing";
-      vscode.postMessage({ type: "set-leaderboard-public", enabled: nextValue });
     });
 
     document.getElementById("share").addEventListener("click", async () => {
@@ -3127,10 +3639,11 @@ function statBlock(value: string, label: string, className = "", valueId = ""): 
   return `<div class="${classes}"><div class="stat-value"${idAttribute}>${escapeHtml(value)}</div><div class="stat-label">${escapeHtml(label)}</div></div>`;
 }
 
-function metricCard(label: string, value: string, subtext: string, icon: string, className = "", valueId = ""): string {
+function metricCard(label: string, value: string, subtext: string, icon: string, className = "", valueId = "", inlineNote = ""): string {
   const classes = ["metric-card", className].filter(Boolean).join(" ");
   const idAttribute = valueId ? ` id="${escapeHtml(valueId)}"` : "";
-  return `<article class="${classes}"><div class="metric-label"><span>${escapeHtml(label)}</span><span class="metric-icon">${icon}</span></div><div class="metric-value"${idAttribute}>${escapeHtml(value)}</div><div class="metric-sub">${subtext.startsWith("+") || subtext.includes("%") ? `<span class="metric-up">${escapeHtml(subtext)}</span>` : escapeHtml(subtext)}</div></article>`;
+  const note = inlineNote ? `<span class="metric-credit-note">${escapeHtml(inlineNote)}</span>` : "";
+  return `<article class="${classes}"><div class="metric-label"><span>${escapeHtml(label)}</span><span class="metric-icon">${icon}</span></div><div class="metric-value"${idAttribute}>${escapeHtml(value)}${note}</div><div class="metric-sub">${subtext.startsWith("+") || subtext.includes("%") ? `<span class="metric-up">${escapeHtml(subtext)}</span>` : escapeHtml(subtext)}</div></article>`;
 }
 
 function insightRow(item: NamedMetric): string {
@@ -3249,6 +3762,18 @@ function refreshIcon(): string {
 
 function calendarIcon(): string {
   return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M7 3v4M17 3v4M4.5 9h15M6.5 5h11A2.5 2.5 0 0 1 20 7.5v11A2.5 2.5 0 0 1 17.5 21h-11A2.5 2.5 0 0 1 4 18.5v-11A2.5 2.5 0 0 1 6.5 5Z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`;
+}
+
+function sunIcon(): string {
+  return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="4" stroke="currentColor" stroke-width="1.8"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`;
+}
+
+function moonIcon(): string {
+  return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg>`;
+}
+
+function monitorIcon(): string {
+  return `<svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="3" y="4" width="18" height="12" rx="2" stroke="currentColor" stroke-width="1.8"/><path d="M8 20h8M12 16v4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`;
 }
 
 function trendIcon(): string {

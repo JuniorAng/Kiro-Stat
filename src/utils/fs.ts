@@ -7,6 +7,8 @@ export type ScanLimits = {
   maxDepth: number;
   maxTotalBytes: number;
   maxFileBytes: number;
+  preferNewest?: boolean;
+  accept?: (name: string) => boolean;
 };
 
 export type ScanResult = {
@@ -17,18 +19,20 @@ export type ScanResult = {
 };
 
 export const DEFAULT_SCAN_LIMITS: ScanLimits = {
-  maxFiles: 2_000,
-  maxDepth: 8,
-  maxTotalBytes: 50 * 1024 * 1024,
-  maxFileBytes: 5 * 1024 * 1024
+  maxFiles: 20_000,
+  maxDepth: 10,
+  maxTotalBytes: 250 * 1024 * 1024,
+  maxFileBytes: 25 * 1024 * 1024
 };
 
 export async function listFilesBounded(root: string, limits: Partial<ScanLimits> = {}): Promise<ScanResult> {
   const resolved = { ...DEFAULT_SCAN_LIMITS, ...limits };
   const result: ScanResult = { files: [], skippedFiles: 0, totalBytes: 0, limited: false };
+  const candidates: { path: string; size: number; mtimeMs: number }[] = [];
   const stack = [{ directory: root, depth: 0 }];
 
-  while (stack.length > 0 && result.files.length < resolved.maxFiles && result.totalBytes < resolved.maxTotalBytes) {
+  // First pass: collect every candidate file (metadata only — never read contents here).
+  while (stack.length > 0) {
     const current = stack.pop()!;
     if (current.depth > resolved.maxDepth) {
       result.limited = true;
@@ -47,24 +51,38 @@ export async function listFilesBounded(root: string, limits: Partial<ScanLimits>
       } else if (entry.isDirectory()) {
         stack.push({ directory: fullPath, depth: current.depth + 1 });
       } else if (entry.isFile()) {
+        if (resolved.accept && !resolved.accept(entry.name)) {
+          continue;
+        }
         try {
           const stat = await fs.stat(fullPath);
-          if (stat.size > resolved.maxFileBytes || result.totalBytes + stat.size > resolved.maxTotalBytes) {
+          if (stat.size > resolved.maxFileBytes) {
             result.skippedFiles += 1;
             result.limited = true;
             continue;
           }
-          result.files.push(fullPath);
-          result.totalBytes += stat.size;
+          candidates.push({ path: fullPath, size: stat.size, mtimeMs: stat.mtimeMs });
         } catch {
           result.skippedFiles += 1;
         }
       }
-      if (result.files.length >= resolved.maxFiles) {
-        result.limited = true;
-        break;
-      }
     }
   }
+
+  if (resolved.preferNewest) {
+    candidates.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  }
+
+  // Second pass: take files in the chosen order until a cap would be exceeded.
+  for (const candidate of candidates) {
+    if (result.files.length >= resolved.maxFiles || result.totalBytes + candidate.size > resolved.maxTotalBytes) {
+      result.skippedFiles += 1;
+      result.limited = true;
+      continue;
+    }
+    result.files.push(candidate.path);
+    result.totalBytes += candidate.size;
+  }
+
   return result;
 }

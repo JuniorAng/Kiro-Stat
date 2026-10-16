@@ -7,6 +7,8 @@ web/**
 kiro-profile-shares/**
 src/**
 test/**
+preview/**
+tools/**
 .github/**
 docs/dev/**
 docs/**

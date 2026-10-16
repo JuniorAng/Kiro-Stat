@@ -3,6 +3,7 @@ out/
 *.vsix
 !releases/*.vsix
 kiro-profile-shares/
+preview/
 .DS_Store
 .env
 .env.*
